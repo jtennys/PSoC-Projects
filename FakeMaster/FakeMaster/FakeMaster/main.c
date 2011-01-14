@@ -9,8 +9,9 @@
 #pragma interrupt_handler TX_TIMEOUT_ISR
 #pragma interrupt_handler RX_TIMEOUT_ISR
 
-// These defines are used as parameters of the commToggle function.
-// Passing one or the other in the function call switches the system between TX and RX modes.
+// These defines are used as parameters of the configToggle function.
+// Passing one or the other in the function call switches the system between PC, TX, and RX modes.
+#define		PC_MODE						(2)
 #define		RX_MODE						(1)
 #define		TX_MODE						(0)
 
@@ -21,8 +22,8 @@
 #define		PORT_4						('D')
 
 // These defines are used as transmission indicators.
-#define		START_TRANSMIT				(248)	// Indicates the beginning of a transmission.
-#define		END_TRANSMIT				(85)	// Indicates the end of a transmission.
+#define		START_TRANSMIT				(252)	// Indicates the beginning of a transmission.
+#define		END_TRANSMIT				(253)	// Indicates the end of a transmission.
 #define		HELLO_BYTE					(200)	// Indicates master is ready to talk.
 #define		ID_ASSIGNMENT				(201)	// Indicates an ID assignment from the master.
 #define		ID_ASSIGN_OK				(202)	// Indicates an ID assignment is acknowledged.
@@ -35,13 +36,14 @@
 
 // These defines are used for transmission timing.
 #define 	RX_TIMEOUT_DURATION			(50)	// This is receive wait time in 1 ms units.
+#define		MAX_TIMEOUTS				(10)	// Number of timeouts allowed before hello mode exit.
 
 // This is the maximum number of allowable modules per branch out from the master
 #define		MAX_MODULES					(250)
 
 // This function receives a mode identifier as a parameter and toggles the
 // system configuration between receive and transmit modes for half duplex UART.
-void commToggle(int mode);
+void configToggle(int mode);
 
 // This function pings the index passed to it. Returns 1 on success, 0 on fail.
 int pingModule(int module_id);
@@ -55,7 +57,17 @@ void decodeTransmission(void);
 
 void sayHello(void);
 
+void moveMotor(int motor_id);
+
 int clearConfig(int module_id);
+// This function checks the current mode and unloads the configuration for that mode.
+void unloadAllConfigs(void);
+// This function unloads the configuration corresponding to the number passed to it.
+void unloadConfig(int config_num);
+// Initialization function for the slave module controllers.
+void initializeSlaves(void);
+// Static wait time of approximately 50 microseconds for use after starting a transmission.
+void xmitWait(void);
 
 // This flag is set if there is a timeout.
 int TIMEOUT;
@@ -66,54 +78,31 @@ char COMMAND_DESTINATION;	// Stores who the current command is for.
 char COMMAND_TYPE;			// Stores the type of command that was just read.
 char PARAM;					// Stores a parameter that accompanies the command (if any).
 
-void main()
-{
-	NUM_MODULES = 0;
+int STATE;					// Stores the current configuration state of the system.
 
+void main()
+{	
+	NUM_MODULES = 0;
+	
 	M8C_EnableGInt;			// Turn on global interrupts for the transmission timeout timer.
 	M8C_EnableIntMask(INT_MSK0,INT_MSK0_GPIO); //activate GPIO ISR
 	
-	// Unload all configs.
-	UnloadConfig_transmitter_config();
-	UnloadConfig_receiver_config();
-	
-	commToggle(RX_MODE);
+	unloadAllConfigs();
+	configToggle(RX_MODE);
 	
 	while(TIMEOUT < 1000)
 	{
 	
 	}
 	
-	commToggle(RX_MODE);
+	// Initialize all of the slave modules.
+	initializeSlaves();
 	
-	// This loop continuously probes and listens at intervals
-	// set by the RX_TIMEOUT_DURATION variable.
 	while(1)
-	{
-		if(RECEIVE_cReadChar() == START_TRANSMIT)
-		{	
-			if(validTransmission())
-			{
-				decodeTransmission();
-			}
-		}
-		if(TIMEOUT >= RX_TIMEOUT_DURATION)
-		{
-			LCD_1_Start();
-			LCD_1_Position(0,0);
-			LCD_1_PrHexInt(NUM_MODULES);
-			LCD_1_Position(0,4);
-			LCD_1_PrCString(" Modules!");
-			
-			TIMEOUT = 0;
-			while(TIMEOUT < RX_TIMEOUT_DURATION);
-			
-			// If we are not maxed out on modules, look for more.
-			if(NUM_MODULES < MAX_MODULES)
-			{
-				sayHello();
-			}
-		}
+	{	
+		while(!UART_1_bCmdCheck()) { }
+		
+		decodeTransmission();
 	}
 }
 
@@ -121,7 +110,7 @@ int pingModule(int module_id)
 {
 	int response = 0;
 	
-	commToggle(TX_MODE);	// Toggle into TX mode.
+	configToggle(TX_MODE);	// Toggle into TX mode.
 			
 	// Transmit a hello.
 	TRANSMIT_PutChar(START_TRANSMIT);
@@ -130,11 +119,14 @@ int pingModule(int module_id)
 	TRANSMIT_PutChar(module_id);
 	TRANSMIT_PutChar(PING);
 	TRANSMIT_PutChar(END_TRANSMIT);
+	TRANSMIT_PutChar(END_TRANSMIT);
 	
 	// Wait for the transmission to finish.
 	while(!( TRANSMIT_bReadTxStatus() & TRANSMIT_TX_COMPLETE));
 	
-	commToggle(RX_MODE);	// Listen for the response.
+	xmitWait();
+	
+	configToggle(RX_MODE);	// Listen for the response.
 	
 	RX_TIMEOUT_Stop();
 	TIMEOUT = 0;
@@ -144,13 +136,14 @@ int pingModule(int module_id)
 	{
 		if(RECEIVE_cReadChar() == START_TRANSMIT)
 		{	
-			if(RECEIVE_cGetChar() == START_TRANSMIT)
+			if(validTransmission())
 			{
-				if(RECEIVE_cGetChar() == module_id)
+				if(COMMAND_TYPE == PING)	// This is the response we are looking for.
 				{
-					if(RECEIVE_cGetChar() == MASTER_ID)
+					// If this is for me, check who it was from.
+					if(COMMAND_DESTINATION == MASTER_ID)
 					{
-						if(RECEIVE_cGetChar() == PING)
+						if(COMMAND_SOURCE == module_id)
 						{
 							response = 1;
 						}
@@ -171,7 +164,7 @@ int assignID(int assigned_ID)
 {
 	int success = 0;		// Stores 0 on fail, 1 on success.
 	
-	commToggle(TX_MODE);	// Switch to TX mode.
+	configToggle(TX_MODE);	// Switch to TX mode.
 
 	// Transmit the assignment.
 	TRANSMIT_PutChar(START_TRANSMIT);
@@ -181,11 +174,14 @@ int assignID(int assigned_ID)
 	TRANSMIT_PutChar(ID_ASSIGNMENT);
 	TRANSMIT_PutChar(assigned_ID);
 	TRANSMIT_PutChar(END_TRANSMIT);
+	TRANSMIT_PutChar(END_TRANSMIT);
 	
 	// Wait for the transmission to finish.
 	while(!( TRANSMIT_bReadTxStatus() & TRANSMIT_TX_COMPLETE));
 	
-	commToggle(RX_MODE);	// Switch back to receive mode.
+	xmitWait();
+	
+	configToggle(RX_MODE);	// Switch back to receive mode.
 	
 	RX_TIMEOUT_Stop();
 	TIMEOUT = 0;
@@ -195,13 +191,14 @@ int assignID(int assigned_ID)
 	{
 		if(RECEIVE_cReadChar() == START_TRANSMIT)
 		{	
-			if(RECEIVE_cGetChar() == START_TRANSMIT)
+			if(validTransmission())
 			{
-				if(RECEIVE_cGetChar() == assigned_ID)
+				if(COMMAND_TYPE == ID_ASSIGN_OK)	// This is the response we are looking for.
 				{
-					if(RECEIVE_cGetChar() == MASTER_ID)
+					// If this is for me, check who it was from.
+					if(COMMAND_DESTINATION == MASTER_ID)
 					{
-						if(RECEIVE_cGetChar() == ID_ASSIGN_OK)
+						if(COMMAND_SOURCE == assigned_ID)
 						{
 							success = 1;
 						}
@@ -210,6 +207,12 @@ int assignID(int assigned_ID)
 			}
 		}
 	}
+	
+	LCD_2_Start();
+	LCD_2_Position(0,0);
+	LCD_2_PrHexInt(NUM_MODULES);
+	LCD_2_Position(0,5);
+	LCD_2_PrCString("Modules!");
 	
 	RX_TIMEOUT_Stop();
 	TIMEOUT = 0;
@@ -222,7 +225,7 @@ int clearConfig(int module_id)
 {
 	int response = 0;
 	
-	commToggle(TX_MODE);	// Toggle into TX mode.
+	configToggle(TX_MODE);	// Toggle into TX mode.
 			
 	// Transmit a hello.
 	TRANSMIT_PutChar(START_TRANSMIT);
@@ -231,11 +234,14 @@ int clearConfig(int module_id)
 	TRANSMIT_PutChar(module_id);
 	TRANSMIT_PutChar(CLEAR_CONFIG);
 	TRANSMIT_PutChar(END_TRANSMIT);
+	TRANSMIT_PutChar(END_TRANSMIT);
 	
 	// Wait for the transmission to finish.
 	while(!( TRANSMIT_bReadTxStatus() & TRANSMIT_TX_COMPLETE));
 	
-	commToggle(RX_MODE);	// Listen for the response.
+	xmitWait();
+	
+	configToggle(RX_MODE);	// Listen for the response.
 	
 	if(module_id != BROADCAST)
 	{
@@ -247,13 +253,14 @@ int clearConfig(int module_id)
 		{
 			if(RECEIVE_cReadChar() == START_TRANSMIT)
 			{	
-				if(RECEIVE_cGetChar() == START_TRANSMIT)
+				if(validTransmission())
 				{
-					if(RECEIVE_cGetChar() == module_id)
+					if(COMMAND_TYPE == CONFIG_CLEARED)	// This is the response we are looking for.
 					{
-						if(RECEIVE_cGetChar() == MASTER_ID)
+						// If this is for me, check who it was from.
+						if(COMMAND_DESTINATION == MASTER_ID)
 						{
-							if(RECEIVE_cGetChar() == CONFIG_CLEARED)
+							if(COMMAND_SOURCE == module_id)
 							{
 								response = 1;
 							}
@@ -274,7 +281,7 @@ int clearConfig(int module_id)
 // This function transmits a hello message.
 void sayHello(void)
 {
-	commToggle(TX_MODE);				// Toggle into TX mode.
+	configToggle(TX_MODE);				// Toggle into TX mode.
 			
 	// Transmit a hello.
 	TRANSMIT_PutChar(START_TRANSMIT);
@@ -283,11 +290,14 @@ void sayHello(void)
 	TRANSMIT_PutChar(BLANK_MODULE_ID);
 	TRANSMIT_PutChar(HELLO_BYTE);
 	TRANSMIT_PutChar(END_TRANSMIT);
+	TRANSMIT_PutChar(END_TRANSMIT);
 	
 	// Wait for the transmission to finish.
 	while(!( TRANSMIT_bReadTxStatus() & TRANSMIT_TX_COMPLETE));
 	
-	commToggle(RX_MODE);				// Listen for the response.
+	xmitWait();
+	
+	configToggle(RX_MODE);				// Listen for the response.
 }
 
 // This function returns whether or not a valid transmission has been received.
@@ -311,78 +321,57 @@ int validTransmission(void)
 // This function decodes the transmission and takes the correct action.
 void decodeTransmission(void)
 {
-	char TEMP_CHILD;
+	char* command;
 	
-	if(COMMAND_TYPE == HELLO_BYTE)			// Someone else is out there!
+	if(command = UART_1_szGetParam())
 	{
-		// If this is for me, assign them an ID.
-		if(COMMAND_DESTINATION == MASTER_ID)
-		{
-			NUM_MODULES++;					// Increment the number of modules connected.
-			
-			//TEMP_CHILD = PARAM;
-
-			if(!assignID(NUM_MODULES))
-			{
-				// If the module did not respond that the ID was assigned,
-				// make an effort to ping it in case that transmission was lost
-				// before ultimately deciding that the module didn't configure.
-				if(!pingModule(NUM_MODULES))
-				{
-					if(!pingModule(NUM_MODULES))
-					{
-						if(!pingModule(NUM_MODULES))
-						{
-							if(!pingModule(NUM_MODULES))
-							{
-								if(!pingModule(NUM_MODULES))
-								{
-									NUM_MODULES--;
-								}
-							}
-						}
-					}
-				}
-			}
+//		LCD_1_Start();
+//		LCD_1_Position(0,0);
+//		LCD_1_PrCString("                ");
+//		LCD_1_Position(0,0);
+//		LCD_1_PrString(command);
 		
-			// Print the child number to the LED's...
-//			if(TEMP_CHILD == PORT_1)
-//			{
-//				PRT1DR |= 0b11111111;
-//				PRT1DR &= 0b11110111;
-//			}
-//			else if(TEMP_CHILD == PORT_2)
-//			{
-//				PRT1DR |= 0b11111111;
-//				PRT1DR &= 0b11011111;
-//			}
-//			else if(TEMP_CHILD == PORT_3)
-//			{
-//				PRT1DR |= 0b11111111;
-//				PRT1DR &= 0b11010111;
-//			}
-//			else if(TEMP_CHILD == PORT_4)
-//			{
-//				PRT1DR |= 0b11111111;
-//				PRT1DR &= 0b01111111;
-//			}
+		if((command[0] == 'm') || (command[0] == 'M'))
+		{
+			moveMotor(atoi(&command[1]));
 		}
 	}
+	
+	UART_1_CmdReset();
 }
 
 // This function allows the program to pass an RX or TX mode flag for switching between modes on the
 // half duplex UART serial communication line.
-void commToggle(int mode)
+void configToggle(int mode)
 {
 	// Disconnect from the global bus and leave the pin high.
 	PRT0DR |= 0b10000000;
 	PRT0GS &= 0b01111111;
 
-	if(mode == RX_MODE)
+	// Unload the configuration of the current state.
+	// If there is no state, blindly wipe all configurations.
+	if(STATE)
 	{
-		// Unload the transmitter configuration.
-		UnloadConfig_transmitter_config();
-		// Load the receiver configuration.
+		unloadConfig(STATE);
+	}
+	else
+	{
+		unloadAllConfigs();
+	}
+	
+	if(mode == PC_MODE)
+	{
+		LoadConfig_pc_listener();
+		
+		UART_1_CmdReset(); 						// Initializes the RX buffer
+		UART_1_IntCntl(UART_1_ENABLE_RX_INT);   // Enable RX interrupts  
+		UART_1_Start(UART_PARITY_NONE);			// Starts the UART.
+		
+		TIMEOUT = 0;
+		STATE = PC_MODE;
+	}
+	else if(mode == RX_MODE)
+	{
 		LoadConfig_receiver_config();
 		
 		// Clear the buffer.
@@ -394,12 +383,11 @@ void commToggle(int mode)
 		TIMEOUT = 0;
 		RX_TIMEOUT_EnableInt();
 		RX_TIMEOUT_Start();
+		
+		STATE = RX_MODE;
 	}
 	else if(mode == TX_MODE)
 	{
-		// Unload the receiver configuration.
-		UnloadConfig_receiver_config();
-		// Load the transmitter configuration.
 		LoadConfig_transmitter_config();
 		// Start the transmitter.
 		TRANSMIT_Start(TRANSMIT_PARITY_NONE);
@@ -416,13 +404,168 @@ void commToggle(int mode)
 		
 		TX_TIMEOUT_Stop();		// Stop the timer.
 		TIMEOUT = 0;			// Reset the timeout flag.
+		
+		STATE = TX_MODE;
 	}
 	
 	// Make sure to keep the LED on (active low).
-	PRT2DR &= 0b11111110;
+	//PRT2DR &= 0b11111110;
+	
+	if(STATE == TX_MODE)
+	{
+		PRT1DR |= 0b00000001;
+	}
+	else
+	{
+		PRT1DR &= 0b11111110;
+		
+	}
 	
 	// Reconnect to the global bus.
 	PRT0GS |= 0b10000000;
+}
+
+// This function blindly unloads all user configurations. This will be called once,
+// when the system initially has no known state.
+void unloadAllConfigs(void)
+{
+	UnloadConfig_pc_listener();
+	UnloadConfig_receiver_config();
+	UnloadConfig_transmitter_config();
+}
+
+// This function unloads the configuration corresponding to the config number passed to it.
+// We do this instead of unloadAllConfigs to cut down on set up time.
+void unloadConfig(int config_num)
+{
+	if(config_num == PC_MODE)
+	{
+		UnloadConfig_pc_listener();
+	}
+	else if(config_num == RX_MODE)
+	{
+		UnloadConfig_receiver_config();
+	}
+	else if(config_num == TX_MODE)
+	{
+		UnloadConfig_transmitter_config();
+	}
+}
+
+void moveMotor(int motor_id)
+{
+	char checksum;
+	char length = 7;
+	char instruction = 3;
+	char address = 30;
+	char value = 6;
+	char motor = motor_id;
+	
+	// Calculate the checksum value for our servo communication.
+	checksum = 255-((motor + length + instruction + address + value)%256);
+	
+	LCD_1_Start();
+	LCD_1_Position(0,0);
+	LCD_1_PrHexByte(motor);
+	
+	// Toggle into transmit mode.
+	configToggle(TX_MODE);
+	
+	// Disconnect your children from the global bus, just in case.
+	PRT0GS &= 0b11100001;
+	
+	TRANSMIT_PutChar(255);			// Start byte one
+	TRANSMIT_PutChar(255);			// Start byte two
+	TRANSMIT_PutChar(motor);		// Servo ID
+	TRANSMIT_PutChar(length);		// The instruction length.
+	TRANSMIT_PutChar(instruction);	// The instruction to carry out.
+	TRANSMIT_PutChar(address);		// The address to read/write from/to.
+	TRANSMIT_PutChar(0);			// LSB of goal position
+	TRANSMIT_PutChar(3);			// MSB of goal position
+	TRANSMIT_PutChar(0);			// LSB of goal speed
+	TRANSMIT_PutChar(3);			// MSB of goal speed
+	TRANSMIT_PutChar(checksum);		// This is the checksum.
+	
+	// Wait for the transmission to finish.
+	while(!( TRANSMIT_bReadTxStatus() & TRANSMIT_TX_COMPLETE));
+	
+	xmitWait();
+	
+	configToggle(PC_MODE);
+}
+
+void initializeSlaves(void)
+{
+	int num_timeouts = 0;
+	
+	sayHello();
+	
+	// This loop continuously probes and listens at intervals
+	// set by the RX_TIMEOUT_DURATION variable.
+	while(num_timeouts < MAX_TIMEOUTS)
+	{					
+		if(RECEIVE_cReadChar() == START_TRANSMIT)
+		{	
+			if(validTransmission())
+			{
+				if(COMMAND_TYPE == HELLO_BYTE)	// Someone else is out there!
+				{
+					// If this is for me, assign them an ID.
+					if(COMMAND_DESTINATION == MASTER_ID)
+					{
+						NUM_MODULES++;			// Increment the number of modules connected.
+						num_timeouts = 0;		// Reset number of timeouts since we found someone.
+			
+						if(!assignID(NUM_MODULES))
+						{
+							// If the module did not respond that the ID was assigned,
+							// make an effort to ping it in case that transmission was lost
+							// before ultimately deciding that the module didn't configure.
+							if(!pingModule(NUM_MODULES))
+							{
+								if(!pingModule(NUM_MODULES))
+								{
+									if(!pingModule(NUM_MODULES))
+									{
+										if(!pingModule(NUM_MODULES))
+										{
+											if(!pingModule(NUM_MODULES))
+											{
+												NUM_MODULES--;
+											}
+										}
+									}
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+		else if(TIMEOUT >= RX_TIMEOUT_DURATION)
+		{	
+			num_timeouts++;
+			
+			// If we are not maxed out on modules, look for more.
+			if(NUM_MODULES < MAX_MODULES)
+			{
+				sayHello();
+			}
+		}
+	}
+	
+	// Switch back to PC mode.
+	configToggle(PC_MODE);
+}
+
+void xmitWait(void)
+{
+	int i;
+	
+	for(i = 0; i < 25; i++)
+	{
+		// Sit here and spin for about 50 microseconds.
+	}
 }
 
 void TX_TIMEOUT_ISR(void)
