@@ -35,8 +35,12 @@
 #define		BLANK_MODULE_ID				(251)	// This is the ID of an unconfigured module.
 
 // These defines are used for transmission timing.
-#define 	RX_TIMEOUT_DURATION			(50)	// This is receive wait time in 1 ms units.
-#define		MAX_TIMEOUTS				(10)	// Number of timeouts allowed before hello mode exit.
+#define 	RX_TIMEOUT_DURATION			(5)		// This is receive wait time in 1 ms units.
+
+// These defines are used for the initial probing stage, where receive waits are longer to make
+// sure of transmission failure or success.
+#define		HELLO_RX_TIMEOUT			(150)	// This is receive wait time in 1 ms units.
+#define		MAX_TIMEOUTS				(5)		// Number of timeouts allowed before hello mode exit.
 
 // This is the maximum number of allowable modules per branch out from the master
 #define		MAX_MODULES					(250)
@@ -82,6 +86,9 @@ int STATE;					// Stores the current configuration state of the system.
 
 void main()
 {	
+	int tempValue = 0;
+	float angle = 0;
+	
 	NUM_MODULES = 0;
 	
 	M8C_EnableGInt;			// Turn on global interrupts for the transmission timeout timer.
@@ -90,9 +97,10 @@ void main()
 	unloadAllConfigs();
 	configToggle(RX_MODE);
 	
-	while(TIMEOUT < 1000)
+	// Sit and wait for the worst case setup time to occur.
+	while(TIMEOUT < (HELLO_RX_TIMEOUT*2))
 	{
-	
+
 	}
 	
 	// Initialize all of the slave modules.
@@ -100,9 +108,64 @@ void main()
 	
 	while(1)
 	{	
-		while(!UART_1_bCmdCheck()) { }
+//		while(!UART_1_bCmdCheck()) { }
+//		
+//		decodeTransmission();
+
+		tempValue = 0;
 		
-		decodeTransmission();
+		configToggle(TX_MODE);	// Toggle into TX mode.
+		
+		TRANSMIT_PutChar(255);			// Start byte one
+		TRANSMIT_PutChar(255);			// Start byte two
+		TRANSMIT_PutChar(3);			// Servo ID
+		TRANSMIT_PutChar(4);			// The instruction length.
+		TRANSMIT_PutChar(2);			// The instruction to carry out.
+		TRANSMIT_PutChar(36);			// The address to read/write from/to.
+		TRANSMIT_PutChar(2);			// The value to write or number of bytes to read.
+		TRANSMIT_PutChar(208);			// This is the checksum.
+		
+		// Wait for the transmission to finish.
+		while(!( TRANSMIT_bReadTxStatus() & TRANSMIT_TX_COMPLETE));
+		
+		xmitWait();
+		
+		configToggle(RX_MODE);	// Listen for the response.
+	
+		RX_TIMEOUT_Stop();
+		TIMEOUT = 0;
+		RX_TIMEOUT_Start();
+		
+		while(TIMEOUT < RX_TIMEOUT_DURATION)
+		{
+			if(RECEIVE_cReadChar() == 255)
+			{
+				PARAM = RECEIVE_cGetChar();
+				PARAM = RECEIVE_cGetChar();
+				PARAM = RECEIVE_cGetChar();
+				PARAM = RECEIVE_cGetChar();
+				PARAM = RECEIVE_cGetChar();
+				tempValue += PARAM;
+				PARAM = RECEIVE_cGetChar();
+				tempValue += PARAM*256;
+				
+				angle = (((float)tempValue)/1023.0)*300.0;
+				
+				TIMEOUT = RX_TIMEOUT_DURATION;
+			}
+		}
+		
+		RX_TIMEOUT_Stop();
+		TIMEOUT = 0;
+		
+		LCD_2_Start();
+		LCD_2_Position(0,0);
+		LCD_2_PrCString("                ");
+		LCD_2_Position(0,0);
+		LCD_2_PrCString("Angle: ");
+		LCD_2_Position(0,7);
+		LCD_2_PrString(ftoa(angle,&tempValue));
+		
 	}
 }
 
@@ -542,7 +605,7 @@ void initializeSlaves(void)
 				}
 			}
 		}
-		else if(TIMEOUT >= RX_TIMEOUT_DURATION)
+		else if(TIMEOUT >= HELLO_RX_TIMEOUT)
 		{	
 			num_timeouts++;
 			
